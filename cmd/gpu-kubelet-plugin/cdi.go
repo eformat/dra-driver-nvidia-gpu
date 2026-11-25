@@ -38,6 +38,7 @@ import (
 	cdiapi "tags.cncf.io/container-device-interface/pkg/cdi"
 	cdiparser "tags.cncf.io/container-device-interface/pkg/parser"
 	cdispec "tags.cncf.io/container-device-interface/specs-go"
+	"go.yaml.in/yaml/v2"
 
 	configapi "sigs.k8s.io/dra-driver-nvidia-gpu/api/nvidia.com/resource/v1beta1"
 	"sigs.k8s.io/dra-driver-nvidia-gpu/internal/common"
@@ -134,10 +135,120 @@ func (cdi *CDIHandler) GetCommonEditsCached() (*cdiapi.ContainerEdits, error) {
 	if err := validateCommonDeviceNodes(v); err != nil {
 		return nil, err
 	}
+
+	// A driver-root-staged CDI contract (e.g. the NVML mock's nvidia.yaml,
+	// which carries the mock's libnvidia-ml, nvidia-smi wrapper, /etc/nvml-mock
+	// config and sysfs mounts plus the MOCK_NVML_* env) applies its edits to
+	// containers only when the runtime resolves that spec — which DRA claim
+	// containers never do: they receive THIS driver's per-claim spec alone.
+	// When a contract file sits next to the claim specs in the CDI root, merge
+	// it into the common edits so claim containers inherit the contract.
+	if mockEdits, err := loadDriverRootCDIContract(cdi.cdiRoot); err != nil {
+		klog.Warningf("Ignoring CDI contract merge: %v", err)
+	} else if mockEdits != nil {
+		klog.Infof("Merging driver-root CDI contract into claim common edits")
+		v.ContainerEdits = mergeContainerEdits(v.ContainerEdits, mockEdits)
+	}
+
 	cdi.specCache.Set(key, v, time.Duration(5*time.Minute))
 	// Return a shallow copy, see above.
 	clone := *v
 	return &clone, nil
+}
+
+// loadDriverRootCDIContract looks for a standalone CDI spec named
+// nvidia.yaml in the CDI root and returns its container edits. nil (with no
+// error) means no contract file is present — the default on real-driver
+// nodes that only carry device specs.
+func loadDriverRootCDIContract(cdiRoot string) (*cdispec.ContainerEdits, error) {
+	path := filepath.Join(cdiRoot, "nvidia.yaml")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("reading %s: %w", path, err)
+	}
+	var parsed cdispec.Spec
+	if err := yaml.Unmarshal(raw, &parsed); err != nil {
+		return nil, fmt.Errorf("parsing %s: %w", path, err)
+	}
+	edits := parsed.ContainerEdits
+	return &edits, nil
+}
+
+// mergeContainerEdits appends b's env, mounts and device nodes onto a,
+// skipping exact-duplicate device nodes (a and b often announce the same
+// /dev nodes; duplicate device nodes in one spec are a CDI validation error).
+//
+// Hooks are deliberately NOT merged: the contract's update-ldcache hook runs
+// inside workload images that may lack a working ldconfig, and a failing CDI
+// hook aborts container creation outright — while the cache update itself is
+// unnecessary on images whose default library search path already covers
+// /usr/lib64 (ubi family). NVIDIA_VISIBLE_DEVICES is dropped for the same
+// reason: the legacy "void" sentinel makes the driver's
+// apply-cuda-memory-limits createRuntime hook exit 1 in DRA claim containers,
+// where devices arrive via CDI device requests rather than the legacy env.
+// Mounts under /sys are dropped too: binding the contract's sysfs over the
+// container's /sys/devices hides the PCI layout the apply-cuda-memory-limits
+// hook walks to resolve the allocated GPU, and the hook's failure aborts
+// container creation. The mock NVML in the container keys on the device
+// nodes and /etc/nvml-mock config, not on sysfs.
+func mergeContainerEdits(a, b *cdispec.ContainerEdits) *cdispec.ContainerEdits {
+	if a == nil {
+		a = &cdispec.ContainerEdits{}
+	}
+	if b == nil {
+		return a
+	}
+	for _, env := range b.Env {
+		if strings.HasPrefix(env, "NVIDIA_VISIBLE_DEVICES=") {
+			continue
+		}
+		a.Env = append(a.Env, env)
+	}
+	for _, m := range b.Mounts {
+		// nvcdi's own common edits deliver the driver-root libraries and
+		// binaries (its create-symlinks + update-ldcache hooks manage
+		// /usr/lib64); duplicating them here collides with those hooks — a
+		// mounted file at a path the symlink hook wants to create makes the
+		// hook exit 1 and aborts container creation. The contract's unique
+		// payload is its env and the /etc/nvml-mock configuration mount.
+		if strings.HasPrefix(m.ContainerPath, "/sys/") ||
+			strings.HasPrefix(m.ContainerPath, "/usr/lib64") ||
+			strings.HasPrefix(m.ContainerPath, "/usr/bin/") {
+			continue
+		}
+		a.Mounts = append(a.Mounts, m)
+	}
+
+	// Make the contract's /usr/lib64 library mount resolvable inside images
+	// whose default loader search path omits it (debian-based CUDA images);
+	// without this the mock's nvidia-smi/lib pair only works on ubi-family
+	// images. Only set it when neither side already carries the variable.
+	hasLdLibraryPath := false
+	for _, env := range a.Env {
+		if strings.HasPrefix(env, "LD_LIBRARY_PATH=") {
+			hasLdLibraryPath = true
+			break
+		}
+	}
+	if !hasLdLibraryPath {
+		a.Env = append(a.Env, "LD_LIBRARY_PATH=/usr/lib64")
+	}
+
+	seen := map[string]bool{}
+	for _, dn := range a.DeviceNodes {
+		seen[dn.Path+"|"+dn.HostPath] = true
+	}
+	for _, dn := range b.DeviceNodes {
+		k := dn.Path + "|" + dn.HostPath
+		if !seen[k] {
+			seen[k] = true
+			a.DeviceNodes = append(a.DeviceNodes, dn)
+		}
+	}
+	return a
 }
 
 func (cdi *CDIHandler) WarmupDevSpecCache(uuids []string) {
@@ -170,6 +281,7 @@ func (cdi *CDIHandler) GetDeviceSpecsByUUIDCached(uuid string) ([]cdispec.Device
 	if err := validateGPUDeviceNodes(uuid, devs); err != nil {
 		return nil, err
 	}
+	cdi.stripMockCUDAHeadroomHooks(devs)
 	cdi.specCache.Set(key, devs, time.Duration(5*time.Minute))
 	clone := make([]cdispec.Device, len(devs))
 	copy(clone, devs)
@@ -201,6 +313,42 @@ func (cdi *CDIHandler) getDeviceSpecsByUUIDAndMinor(uuid string, minor int) ([]c
 		return nil, err
 	}
 	return devices, nil
+}
+
+// stripMockCUDAHeadroomHooks removes nvcdi's apply-cuda-memory-limits
+// createRuntime hooks when running against the NVML mock driver tree. The hook
+// executes inside the workload container and resolves libnvidia-ml there — on
+// images that ship a real NVML (CUDA images) it drives the mock's character
+// devices with real NVML and exits 1, aborting container creation outright.
+// The hook enforces per-MIG-device CUDA memory limits, which the mock does not
+// model. Real-driver roots keep the hook untouched.
+func (cdi *CDIHandler) stripMockCUDAHeadroomHooks(devs []cdispec.Device) {
+	if !strings.Contains(cdi.targetDriverRoot, "nvml-mock") {
+		return
+	}
+	stripped := 0
+	for i := range devs {
+		edits := &devs[i].ContainerEdits
+		kept := edits.Hooks[:0]
+		for _, hook := range edits.Hooks {
+			isCUDAHeadroom := false
+			for _, arg := range hook.Args {
+				if arg == "apply-cuda-memory-limits" {
+					isCUDAHeadroom = true
+					break
+				}
+			}
+			if isCUDAHeadroom {
+				stripped++
+				continue
+			}
+			kept = append(kept, hook)
+		}
+		edits.Hooks = kept
+	}
+	if stripped > 0 {
+		klog.V(1).Infof("Stripped %d apply-cuda-memory-limits hook(s): mock driver root, workload images carrying real NVML cannot drive the mock's device nodes", stripped)
+	}
 }
 
 // validateCommonDeviceNodes verifies that nvcdi emitted the global NVIDIA

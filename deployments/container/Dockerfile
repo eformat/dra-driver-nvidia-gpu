@@ -53,8 +53,12 @@ RUN apt-get update && apt-get install -y \
         gcc-x86-64-linux-gnu && \
         rm -rf /var/lib/apt/lists/* /var/cache/apt/archives
 
-RUN curl -sSfL --retry 8 --retry-all-errors --connect-timeout 10 --retry-delay 5 \
-        https://go.dev/dl/go${GOLANG_VERSION}.linux-${BUILDARCH}.tar.gz | tar -C /usr/local -xz
+# The Go toolchain tarball is vendored in the build context: go.dev/dl does
+# not host go1.27.x binaries (404), while the module proxy serves the
+# toolchain module — repackaged here as the standard go/ layout
+# (go1.27.3.linux-amd64-vendored.tar.gz, see hack/golang-version.sh).
+COPY go${GOLANG_VERSION}.linux-amd64-vendored.tar.gz /tmp/go.tar.gz
+RUN tar -C /usr/local -xzf /tmp/go.tar.gz && rm /tmp/go.tar.gz
 
 ENV GOPATH=/go
 ENV PATH=$GOPATH/bin:/usr/local/go/bin:$PATH
