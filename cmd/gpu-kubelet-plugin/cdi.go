@@ -216,7 +216,7 @@ func mergeContainerEdits(a, b *cdispec.ContainerEdits) *cdispec.ContainerEdits {
 		// payload is its env and the /etc/nvml-mock configuration mount.
 		if strings.HasPrefix(m.ContainerPath, "/sys/") ||
 			strings.HasPrefix(m.ContainerPath, "/usr/lib64") ||
-			strings.HasPrefix(m.ContainerPath, "/usr/bin/") {
+			(strings.HasPrefix(m.ContainerPath, "/usr/bin/") && m.ContainerPath != "/usr/bin/nvidia-smi") {
 			continue
 		}
 		a.Mounts = append(a.Mounts, m)

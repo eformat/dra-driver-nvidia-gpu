@@ -1232,6 +1232,7 @@ func (l deviceLib) deleteMigDevice(miglt *MigLiveTuple) error {
 		if err := l.maybeDisableMigMode(parentUUID, parentNvmlDev); err != nil {
 			return fmt.Errorf("failed to disable MIG mode for %s (maybeDisableMigMode): %w", parentUUID, err)
 		}
+		l.rearmMigModeAfterTeardown(parentUUID, parentNvmlDev)
 		return nil
 	}
 
@@ -1288,8 +1289,32 @@ func (l deviceLib) deleteMigDevice(miglt *MigLiveTuple) error {
 	if err := l.maybeDisableMigMode(parentUUID, parentNvmlDev); err != nil {
 		return fmt.Errorf("failed to disable MIG mode for %s (maybeDisableMigMode): %w", parentUUID, err)
 	}
-
+	l.rearmMigModeAfterTeardown(parentUUID, parentNvmlDev)
 	return nil
+}
+
+// rearmMigModeAfterTeardown restores the partitionable resting state after a
+// claim's MIG teardown empties a board. Under DynamicMIG the published MIG
+// surface is mode-independent (Hopper+ reset-less toggling), a whole-GPU claim
+// flips the mode off only for its own allocation, and a MIG claim re-enables
+// it at carve — so a board emptied by a release goes back to MIG-enabled.
+// Without this the disable persists (the NVML mock writes it to
+// overrides.yaml) and boards accumulate dark across claim churn. Legacy
+// (non-DynamicMIG) flows and architectures without reset-less toggling keep
+// the existing behavior.
+func (l deviceLib) rearmMigModeAfterTeardown(uuid string, nvmldev nvml.Device) {
+	if !featuregates.Enabled(featuregates.DynamicMIG) {
+		return
+	}
+	if !supportsMIGModeToggle(nvmldev) {
+		return
+	}
+	ret, activationStatus := nvmldev.SetMigMode(nvml.DEVICE_MIG_ENABLE)
+	if ret != nvml.SUCCESS {
+		klog.Warningf("GPU %s: re-arming MIG mode after teardown failed: %v (activationStatus: %v)", uuid, ret, activationStatus)
+		return
+	}
+	klog.V(1).Infof("GPU %s: MIG mode re-armed after teardown (partitionable resting state)", uuid)
 }
 
 func (l deviceLib) maybeDisableMigMode(uuid string, nvmldev nvml.Device) error {
